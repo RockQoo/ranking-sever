@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Ranking.Api/Ranking.Api.csproj" />
+    <Project Path="src/Ranking.Bench/Ranking.Bench.csproj" />
+    <Project Path="src/Ranking.Core/Ranking.Core.csproj" />
+    <Project Path="src/Ranking.Kafka/Ranking.Kafka.csproj" />
+  </Folder>
+</Solution>
