@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 개요
 
-게임 랭킹을 **Redis Sorted Set**과 **MySQL(InnoDB)** 두 저장소로 구현해 속도를 비교하는 .NET 10 프로젝트. Kafka → Redis 멱등 반영 데모도 들어 있다. 측정 결과와 해석은 README에, 벤치마크 원본 출력은 `results/*.md`에 있다. 코드 주석, 문서, 로그 출력은 한글로 쓴다.
+게임 랭킹을 **Redis Sorted Set**과 **MySQL(InnoDB)** 두 저장소로 구현해 속도를 비교하는 .NET 10 프로젝트. Kafka → Redis 멱등 반영 데모도 들어 있다. README는 핵심 결론만 담는다. 상세 수치와 해석은 `docs/측정결과.md`(브라우저용 `docs/측정결과.html`도 같이 고친다), 벤치마크 원본 출력은 `results/*.md`에 있다. 코드 주석, 문서, 로그 출력은 한글로 쓴다.
 
 - GitHub: https://github.com/RockQoo/ranking-sever.git
 
