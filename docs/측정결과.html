@@ -7,7 +7,7 @@
 <style>
   :root {
     --bg: #14161a; --panel: #1c1f25; --line: #2c313a; --text: #e4e6ea; --muted: #9aa1ad;
-    --redis: #e06c5a; --mysql: #e8b04a; --mysql2: #8f7cc9; --ok: #6cc28a; --accent: #6aa8f0;
+    --redis: #e06c5a; --mysql: #e8b04a; --mysql2: #8f7cc9; --snap: #4fb8c4; --ok: #6cc28a; --accent: #6aa8f0;
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text);
@@ -28,7 +28,8 @@
   th { color: var(--muted); font-weight: 600; background: #191c21; }
   td:first-child, th:first-child { text-align: left; }
   td.l, th.l { text-align: left; white-space: normal; }
-  .r { color: var(--redis); } .m { color: var(--mysql); } .m2 { color: var(--mysql2); } .ok { color: var(--ok); }
+  .r { color: var(--redis); } .m { color: var(--mysql); } .m2 { color: var(--mysql2); } .s { color: var(--snap); } .ok { color: var(--ok); }
+  .bad { color: var(--redis); }
   b.big { font-size: 17px; }
   code { background: #262a31; padding: 1px 5px; border-radius: 4px; font-size: 13px; }
   .bars { display: grid; grid-template-columns: 110px 1fr; gap: 6px 10px; align-items: center; font-size: 13px; }
@@ -43,11 +44,11 @@
 <body>
 <main>
   <h1>랭킹 서버 측정 결과</h1>
-  <p class="sub">Redis Sorted Set vs MySQL(InnoDB), Kafka → Redis 멱등 반영 · 2026-10-16 ~ 10-17</p>
+  <p class="sub">Redis Sorted Set vs MySQL(InnoDB), MySQL 순위 테이블 배치 재계산, Kafka → Redis 멱등 반영 · 2026-10-16 ~ 10-18</p>
 
   <nav>
     <a href="#env">환경</a><a href="#summary">요약</a><a href="#latency">순차 지연</a><a href="#tput">동시 처리량</a>
-    <a href="#durable">영속화</a><a href="#deep">깊은 페이지</a><a href="#kafka">Kafka</a><a href="#limits">한계</a>
+    <a href="#durable">영속화</a><a href="#deep">깊은 페이지</a><a href="#snapshot">순위 테이블</a><a href="#kafka">Kafka</a><a href="#limits">한계</a>
   </nav>
 
   <h2 id="env">측정 환경</h2>
@@ -71,9 +72,10 @@
       <tr><td>상위 100명</td><td>0.28ms</td><td>0.65ms</td><td>약 2배</td></tr>
       <tr><td>깊은 페이지 (90만 등부터 10명)</td><td>0.25ms</td><td>93ms (커버링) / 345ms</td><td>372배 / 1,385배</td></tr>
       <tr><td>동시 32개 내 순위 처리량</td><td>초당 71,203</td><td>초당 223</td><td>약 320배</td></tr>
+      <tr><td class="s">MySQL 순위 테이블 (배치 재계산)</td><td>0.27ms · 초당 48,005</td><td class="s">내 순위 0.67ms · 초당 13,521</td><td>2~4배 (대신 재계산 주기만큼 늦음)</td></tr>
     </table></div>
     <p><b>왜:</b> Redis ZSET의 skiplist는 링크마다 건너뛰는 원소 수(span)를 저장해 순위·offset 위치를 O(log N)에 찾는다. InnoDB B+Tree는 하위 원소 수가 없어서 앞에 있는 행을 세거나 읽고 버려야 한다 → O(순위), O(offset).</p>
-    <p><b>설계:</b> 실시간 순위는 Redis, 원본과 시즌 정산은 DB. 이벤트가 많으면 Kafka로 분리하고 반영을 멱등으로.</p>
+    <p><b>설계:</b> 실시간 순위는 Redis, 원본과 시즌 정산은 DB. 이벤트가 많으면 Kafka로 분리하고 반영을 멱등으로. MySQL만 써야 하면 순위 테이블을 배치로 만들어 바꿔치기한다.</p>
   </div>
 
   <h2 id="latency">1. 순차 지연 시간 — 평균 ms (클라이언트 1개)</h2>
@@ -188,7 +190,60 @@
   <h3>MySQL로 "더 보기"를 해야 한다면</h3>
   <p>offset 대신 <b>키셋 페이지네이션</b>: 직전 페이지 마지막 행의 (score, user_id)로 <code>WHERE score &lt; @s OR (score = @s AND user_id &lt; @u) ORDER BY score DESC, user_id DESC LIMIT 10</code>. 다음 페이지는 offset과 무관해지지만 "N번째 페이지로 바로 이동"은 안 된다. <span class="note">(측정하지 않음)</span></p>
 
-  <h2 id="kafka">5. Kafka → Redis 랭킹 반영 — 이벤트 20만 건, 유저 1만 명</h2>
+  <h2 id="snapshot">5. 순위 테이블 배치 재계산 + 바꿔치기 — MySQL, 100만 명 (2026-10-18)</h2>
+  <div class="box">
+    <ul>
+      <li>점수는 원본 <code>ranking</code>에 쌓고, 주기적으로 순위를 계산해 <code>ranking_snapshot(user_id PK, score, rnk UNIQUE)</code>에 넣는다. 게임은 순위 테이블만 조회</li>
+      <li>재계산: 새 테이블에 <code>INSERT … SELECT user_id, score, ROW_NUMBER() OVER (ORDER BY score DESC, user_id DESC) FROM ranking</code> → <code>ANALYZE TABLE</code> → <code>RENAME TABLE ranking_snapshot TO …_old, ranking_snapshot_new TO ranking_snapshot</code> (한 문장이라 원자적)</li>
+      <li>조회: 내 순위는 PK, 상위 N명·깊은 페이지·주변은 <code>rnk BETWEEN</code> 범위</li>
+    </ul>
+  </div>
+
+  <h3>조회 속도 — 순차 평균 ms, 200회</h3>
+  <div class="wrap"><table>
+    <tr><th>연산</th><th class="r">Redis</th><th class="m">MySQL 실시간 COUNT</th><th class="s">MySQL 순위 테이블</th></tr>
+    <tr><td>내 순위 (무작위 유저)</td><td>0.27</td><td>34.8</td><td class="s"><b>0.67</b></td></tr>
+    <tr><td>내 순위 (하위 1%)</td><td>0.27</td><td>66.1</td><td class="s"><b>0.65</b></td></tr>
+    <tr><td>상위 100명</td><td>0.35</td><td>0.70</td><td class="s">0.80</td></tr>
+    <tr><td>내 주변 ±5명</td><td>0.53</td><td>38.0</td><td class="s">1.34</td></tr>
+    <tr><td>깊은 페이지 (90만 등부터 10명)</td><td>0.25</td><td>94.5</td><td class="s"><b>0.69</b></td></tr>
+    <tr><td>내 순위 동시 32개 — 초당 처리</td><td>48,005</td><td><b>250</b></td><td class="s"><b>13,521</b></td></tr>
+  </table></div>
+  <p class="note">Redis와 결과 비교(순위 200건, 상위 100명, 주변 ±5명 20건, 깊은 페이지) 불일치 0건.</p>
+
+  <h3>재계산 방식별 — 재계산 중 순위 조회 8개 작업이 계속 돈다</h3>
+  <div class="wrap"><table>
+    <tr><th class="l">방식</th><th>재계산 (부하 없음 / 있음)</th><th>조회 수</th><th>못 찾음</th><th>조회 최대 지연</th></tr>
+    <tr><td class="l ok">새 테이블 + RENAME 바꿔치기</td><td>3.6s / 9.4s</td><td>100,034</td><td class="ok"><b>0</b></td><td>24ms</td></tr>
+    <tr><td class="l bad">TRUNCATE 후 다시 채우기</td><td>3.7s / 8.5s</td><td>94,596</td><td class="bad"><b>83,707 (88%)</b></td><td>32ms</td></tr>
+    <tr><td class="l">한 트랜잭션에서 DELETE 후 다시 채우기</td><td><b>11.1s / 31.6s</b></td><td>294,166</td><td class="ok">0</td><td>16ms</td></tr>
+    <tr><td class="l bad">바꿔치기 + 순위 테이블을 읽은 트랜잭션이 RENAME을 2초 막음</td><td>—</td><td>99,609</td><td class="ok">0</td><td class="bad"><b>2,064ms</b></td></tr>
+  </table></div>
+
+  <h3>재계산 중 원본 점수 갱신 — 갱신 8개 작업이 계속 돈다 (바꿔치기 방식)</h3>
+  <div class="wrap"><table>
+    <tr><th class="l">재계산 세션 격리 수준</th><th>재계산 중 갱신 수</th><th>오류</th><th>p99</th><th>최대 지연</th></tr>
+    <tr><td class="l bad">REPEATABLE READ (MySQL 기본)</td><td>1,616</td><td class="bad"><b>데드락 6건</b></td><td>12ms</td><td class="bad"><b>4,490ms</b></td></tr>
+    <tr><td class="l ok">READ COMMITTED</td><td>7,769</td><td class="ok">0</td><td>37ms</td><td>69ms</td></tr>
+  </table></div>
+
+  <div class="box key">
+    <ul>
+      <li><b>효과는 "순위를 미리 계산"에서 나온다.</b> 내 순위 35~66ms → 0.65ms, 동시 처리 250 → 13,521건/초. 깊은 페이지도 <code>OFFSET</code> 대신 <code>rnk</code> 범위라 순위와 무관. 대가는 재계산 주기만큼 순위가 늦다는 것</li>
+      <li><b>바꿔치기는 속도가 아니라 조회 안전성 때문이다.</b> TRUNCATE 후 채우면 그 사이 조회의 88%가 "랭킹에 없음". 바꿔치기는 항상 이전 아니면 새 테이블을 봐서 0건</li>
+      <li><b>InnoDB는 한 트랜잭션 DELETE + INSERT도 실패가 없다</b>(MVCC로 커밋 전까지 이전 행을 읽음). 대신 3배 느리고 undo가 쌓인다. MSSQL 기본 설정(READ COMMITTED, 스냅숏 격리 꺼짐)이면 이 방식은 조회가 커밋까지 막힌다 → MSSQL에서 리네임 방식을 쓰는 이유 <span class="note">(MSSQL은 측정 안 함)</span></li>
+    </ul>
+  </div>
+  <div class="box warn">
+    <p><b>함정 세 가지</b></p>
+    <ul>
+      <li><b>재계산 세션은 READ COMMITTED.</b> 기본(REPEATABLE READ + binlog)에서는 <code>INSERT … SELECT</code>가 원본 행마다 공유 잠금을 걸어 재계산 내내 점수 갱신이 막히고(최대 4.5초) 데드락도 난다</li>
+      <li><b>바꿔치기 전에 <code>ANALYZE TABLE</code>.</b> 새로 채운 테이블은 통계가 "빈 테이블"(rows=21)이라 <code>rnk</code> 인덱스를 두고 <code>ALL</code> + <code>Using filesort</code>를 골랐다. 상위 100명 첫 조회 95ms(정상 0.8ms). InnoDB 백그라운드 통계 재계산 전까지 느리다</li>
+      <li><b>RENAME은 메타데이터 잠금(MDL)이 필요하다.</b> 순위 테이블을 읽은 트랜잭션이 열려 있으면 RENAME이 기다리고, 그 뒤 조회도 전부 줄을 선다. 긴 정산·통계 쿼리와 시각을 겹치지 않고 <code>lock_wait_timeout</code>을 짧게 걸어 재시도한다(기본값 1년)</li>
+    </ul>
+  </div>
+
+  <h2 id="kafka">6. Kafka → Redis 랭킹 반영 — 이벤트 20만 건, 유저 1만 명</h2>
   <div class="box">
     <ul>
       <li>토픽 <code>score-events</code> 파티션 4개, 키 = user_id → 같은 유저는 같은 파티션 → <b>유저별 순서 보장</b></li>
@@ -221,7 +276,7 @@
     <li>모두 기본 설정. MySQL buffer pool(128MB)에 100만 명 테이블(score-only 약 75MB)이 다 들어가 디스크 읽기는 거의 없었을 것(확인 안 함)</li>
     <li>각 조건 1회 측정. 수치는 차이의 크기(몇 배)를 보는 용도</li>
   </ul>
-  <p class="note">원본: <code>results/</code> 폴더의 Markdown 파일. 설계 해석은 <code>README.md</code>.</p>
+  <p class="note">원본: <code>results/</code> 폴더의 Markdown 파일. 설계 해석은 <code>README.md</code>, 셋팅은 <code>SETUP.md</code>.</p>
 </main>
 </body>
 </html>
