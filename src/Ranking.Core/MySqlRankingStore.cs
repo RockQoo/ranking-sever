@@ -9,13 +9,13 @@ public enum MySqlRankMode
     /// <summary>나보다 앞선 행 수를 (score, user_id) 인덱스로 센다. 비용은 내 순위에 비례(O(rank)).</summary>
     Count,
 
-    /// <summary>RANK() 윈도 함수로 전체를 정렬한 뒤 나를 찾는다. 매번 전체 정렬(O(N log N)).</summary>
+    /// <summary>ROW_NUMBER() 윈도 함수로 전체를 정렬한 뒤 나를 찾는다. 매번 전체 정렬(O(N log N)).</summary>
     Window,
 }
 
 /// <summary>
-/// MySQL(InnoDB) 랭킹. (score, user_id) 보조 인덱스 하나로
-/// 상위 N명은 인덱스 역방향 스캔, 내 순위는 COUNT로 구한다.
+/// MySQL(InnoDB) 랭킹, 실시간 계산. 테이블은 sql/schema.sql의 ranking, 쿼리는 sql/procedures.sql의 sp_ranking_*.
+/// (score, user_id) 보조 인덱스 하나로 상위 N명은 인덱스 역방향 스캔, 내 순위는 COUNT로 구한다.
 /// </summary>
 public sealed class MySqlRankingStore : IRankingStore
 {
@@ -30,38 +30,9 @@ public sealed class MySqlRankingStore : IRankingStore
         _rankMode = rankMode;
     }
 
-    private const string CreateTableSql = """
-        CREATE TABLE ranking (
-            user_id INT    NOT NULL PRIMARY KEY,
-            score   BIGINT NOT NULL,
-            KEY ix_score (score, user_id)
-        ) ENGINE=InnoDB
-        """;
+    public Task ResetAsync() => MySqlProc.ExecuteAsync(_dataSource, "CALL sp_ranking_reset()");
 
-    // 나보다 앞선 사람 수 + 1. 두 COUNT 모두 ix_score 범위 스캔이다.
-    // (score, user_id) > (s, u) 같은 행 생성자 비교는 MySQL이 인덱스를 잘 못 써서 둘로 나눴다.
-    private const string RankExpr = """
-        1 + (SELECT COUNT(*) FROM ranking WHERE score > t.score)
-          + (SELECT COUNT(*) FROM ranking WHERE score = t.score AND user_id > t.user_id)
-        """;
-
-    private const string RankByCountSql = "SELECT " + RankExpr + " FROM ranking t WHERE t.user_id = @u";
-
-    private const string RankByWindowSql = """
-        SELECT rnk FROM (
-            SELECT user_id, ROW_NUMBER() OVER (ORDER BY score DESC, user_id DESC) AS rnk
-            FROM ranking
-        ) x
-        WHERE x.user_id = @u
-        """;
-
-    public async Task ResetAsync()
-    {
-        await using var conn = await _dataSource.OpenConnectionAsync();
-        await ExecuteAsync(conn, "DROP TABLE IF EXISTS ranking");
-        await ExecuteAsync(conn, CreateTableSql);
-    }
-
+    // 대량 적재는 게임 서버가 아니라 도구가 하는 일이라 SP 대신 다중 행 INSERT로 넣는다.
     public async Task BulkLoadAsync(IReadOnlyList<(int UserId, long Score)> rows)
     {
         const int batchSize = 5_000;
@@ -85,126 +56,42 @@ public sealed class MySqlRankingStore : IRankingStore
         }
 
         await tx.CommitAsync();
-        await ExecuteAsync(conn, "ANALYZE TABLE ranking");
+        await using var analyze = new MySqlCommand("ANALYZE TABLE ranking", conn);
+        await analyze.ExecuteNonQueryAsync();
     }
 
-    public async Task SetScoreAsync(int userId, long score)
-    {
-        await using var conn = await _dataSource.OpenConnectionAsync();
-        await using var cmd = new MySqlCommand(
-            "INSERT INTO ranking (user_id, score) VALUES (@u, @s) AS new ON DUPLICATE KEY UPDATE score = new.score",
-            conn);
-        cmd.Parameters.AddWithValue("@u", userId);
-        cmd.Parameters.AddWithValue("@s", score);
-        await cmd.ExecuteNonQueryAsync();
-    }
+    public Task SetScoreAsync(int userId, long score) =>
+        MySqlProc.ExecuteAsync(_dataSource, "CALL sp_ranking_set_score(@u, @s)", ("@u", userId), ("@s", score));
 
     public async Task<long?> GetRankAsync(int userId)
     {
-        await using var conn = await _dataSource.OpenConnectionAsync();
-        await using var cmd = new MySqlCommand(_rankMode == MySqlRankMode.Count ? RankByCountSql : RankByWindowSql, conn);
-        cmd.Parameters.AddWithValue("@u", userId);
-        var result = await cmd.ExecuteScalarAsync();
-        return result is null or DBNull ? null : Convert.ToInt64(result);
+        var call = _rankMode == MySqlRankMode.Count ? "CALL sp_ranking_get_rank(@u)" : "CALL sp_ranking_get_rank_window(@u)";
+        var result = await MySqlProc.ScalarAsync(_dataSource, call, ("@u", userId));
+        return result is null ? null : Convert.ToInt64(result);
     }
 
     public async Task<IReadOnlyList<RankEntry>> GetTopAsync(int n)
     {
-        await using var conn = await _dataSource.OpenConnectionAsync();
-        await using var cmd = new MySqlCommand(
-            "SELECT user_id, score FROM ranking ORDER BY score DESC, user_id DESC LIMIT @n", conn);
-        cmd.Parameters.AddWithValue("@n", n);
-
-        var result = new List<RankEntry>(n);
-        await using var reader = await cmd.ExecuteReaderAsync();
-        while (await reader.ReadAsync())
-            result.Add(new RankEntry(reader.GetInt32(0), reader.GetInt64(1), result.Count + 1));
-        return result;
+        var rows = await MySqlProc.ReadAsync(_dataSource, "CALL sp_ranking_get_top(@n)",
+            r => (UserId: r.GetInt32(0), Score: r.GetInt64(1)), ("@n", n));
+        return rows.Select((row, i) => new RankEntry(row.UserId, row.Score, i + 1)).ToList();
     }
 
     // LIMIT ... OFFSET은 앞의 offset개를 인덱스에서 읽고 버린다. 비용은 offset에 비례.
     public async Task<IReadOnlyList<RankEntry>> GetPageAsync(long offset, int count)
     {
-        await using var conn = await _dataSource.OpenConnectionAsync();
-        await using var cmd = new MySqlCommand(
-            "SELECT user_id, score FROM ranking ORDER BY score DESC, user_id DESC LIMIT @n OFFSET @o", conn);
-        cmd.Parameters.AddWithValue("@n", count);
-        cmd.Parameters.AddWithValue("@o", offset);
-
-        var result = new List<RankEntry>(count);
-        await using var reader = await cmd.ExecuteReaderAsync();
-        while (await reader.ReadAsync())
-            result.Add(new RankEntry(reader.GetInt32(0), reader.GetInt64(1), offset + result.Count + 1));
-        return result;
+        var rows = await MySqlProc.ReadAsync(_dataSource, "CALL sp_ranking_get_page(@o, @n)",
+            r => (UserId: r.GetInt32(0), Score: r.GetInt64(1)), ("@o", offset), ("@n", count));
+        return rows.Select((row, i) => new RankEntry(row.UserId, row.Score, offset + i + 1)).ToList();
     }
 
-    public async Task<IReadOnlyList<RankEntry>> GetAroundAsync(int userId, int range)
-    {
-        await using var conn = await _dataSource.OpenConnectionAsync();
+    // 내 순위 COUNT와 위·아래 range명 조회를 SP 하나에서 한다 (1회 왕복).
+    public async Task<IReadOnlyList<RankEntry>> GetAroundAsync(int userId, int range) =>
+        await MySqlProc.ReadAsync(_dataSource, "CALL sp_ranking_get_around(@u, @k)",
+            r => new RankEntry(r.GetInt32(0), r.GetInt64(1), r.GetInt64(2)), ("@u", userId), ("@k", range));
 
-        // 1) 내 점수와 순위
-        long myScore;
-        long myRank;
-        await using (var cmd = new MySqlCommand(
-            "SELECT t.score, " + RankExpr + " FROM ranking t WHERE t.user_id = @u", conn))
-        {
-            cmd.Parameters.AddWithValue("@u", userId);
-            await using var reader = await cmd.ExecuteReaderAsync();
-            if (!await reader.ReadAsync())
-                return [];
-            myScore = reader.GetInt64(0);
-            myRank = reader.GetInt64(1);
-        }
-
-        // 2) 내 위 range명(역순으로 읽어 뒤집는다) + 나 + 내 아래 range명
-        await using (var cmd = new MySqlCommand("""
-            (SELECT user_id, score, 0 AS part FROM ranking
-              WHERE score > @s OR (score = @s AND user_id > @u)
-              ORDER BY score ASC, user_id ASC LIMIT @k)
-            UNION ALL
-            (SELECT user_id, score, 1 AS part FROM ranking
-              WHERE score < @s OR (score = @s AND user_id < @u)
-              ORDER BY score DESC, user_id DESC LIMIT @k)
-            """, conn))
-        {
-            cmd.Parameters.AddWithValue("@s", myScore);
-            cmd.Parameters.AddWithValue("@u", userId);
-            cmd.Parameters.AddWithValue("@k", range);
-
-            var above = new List<(int, long)>(range);
-            var below = new List<(int, long)>(range);
-            await using var reader = await cmd.ExecuteReaderAsync();
-            while (await reader.ReadAsync())
-            {
-                var row = (reader.GetInt32(0), reader.GetInt64(1));
-                if (reader.GetInt32(2) == 0)
-                    above.Add(row);
-                else
-                    below.Add(row);
-            }
-
-            var result = new List<RankEntry>(above.Count + 1 + below.Count);
-            for (var i = above.Count - 1; i >= 0; --i)
-                result.Add(new RankEntry(above[i].Item1, above[i].Item2, myRank - (i + 1)));
-            result.Add(new RankEntry(userId, myScore, myRank));
-            for (var i = 0; i < below.Count; ++i)
-                result.Add(new RankEntry(below[i].Item1, below[i].Item2, myRank + (i + 1)));
-            return result;
-        }
-    }
-
-    public async Task<long> CountAsync()
-    {
-        await using var conn = await _dataSource.OpenConnectionAsync();
-        await using var cmd = new MySqlCommand("SELECT COUNT(*) FROM ranking", conn);
-        return Convert.ToInt64(await cmd.ExecuteScalarAsync());
-    }
-
-    private static async Task ExecuteAsync(MySqlConnection conn, string sql)
-    {
-        await using var cmd = new MySqlCommand(sql, conn);
-        await cmd.ExecuteNonQueryAsync();
-    }
+    public async Task<long> CountAsync() =>
+        Convert.ToInt64(await MySqlProc.ScalarAsync(_dataSource, "CALL sp_ranking_count()"));
 
     public ValueTask DisposeAsync() => _dataSource.DisposeAsync();
 }

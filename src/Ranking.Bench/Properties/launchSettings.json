@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json.schemastore.org/launchsettings.json",
+  "profiles": {
+    "기본 비교 (1만 명, 디버깅용)": {
+      "commandName": "Project",
+      "commandLineArgs": "--users 10000 --ops 100 --throughput-ops 1000"
+    },
+    "기본 비교 (100만 명)": {
+      "commandName": "Project",
+      "commandLineArgs": "--users 1000000 --window-ops 10"
+    },
+    "깊은 페이지 (10만 명)": {
+      "commandName": "Project",
+      "commandLineArgs": "--deep-page --users 100000 --page-ops 10"
+    },
+    "순위 테이블 (10만 명)": {
+      "commandName": "Project",
+      "commandLineArgs": "--snapshot --users 100000 --snapshot-ops 50"
+    }
+  }
+}

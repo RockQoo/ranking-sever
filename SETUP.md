@@ -43,7 +43,7 @@ wsl -d Ubuntu -u root -- bash scripts/setup-wsl.sh --with-kafka
 ```
 
 - Kafka 데모를 안 돌리면 `--with-kafka`를 빼도 된다.
-- 하는 일: Redis, MySQL 설치와 서비스 등록 → DB `ranking`, 계정 `bench`/`bench` 생성 → (선택) Kafka를 `/opt/kafka`에 받아 `127.0.0.1:9092`로 광고하게 설정하고, systemd 서비스 `kafka`로 등록한다.
+- 하는 일: Redis, MySQL 설치와 서비스 등록 → DB `ranking`, 계정 `bench`/`bench` 생성 → `sql/schema.sql`(테이블·인덱스)과 `sql/procedures.sql`(저장 프로시저) 적용 → (선택) Kafka를 `/opt/kafka`에 받아 `127.0.0.1:9092`로 광고하게 설정하고, systemd 서비스 `kafka`로 등록한다.
 - 여러 번 실행해도 된다. 이미 설치된 패키지는 버전을 바꾸지 않는다.
 - 끝에 `PONG`, `mysql ok`, `kafka ok`, `완료`가 나오면 성공이다.
 - "systemd가 꺼져 있다"가 나오면 WSL 안의 `/etc/wsl.conf`에 아래를 넣는다. 그다음 Windows에서 `wsl --shutdown`을 하고 다시 실행한다.
@@ -51,6 +51,12 @@ wsl -d Ubuntu -u root -- bash scripts/setup-wsl.sh --with-kafka
   [boot]
   systemd=true
   ```
+
+`sql/`의 파일을 고쳤으면 그것만 다시 적용한다. 측정이 돌고 있을 때는 하지 않는다(SP를 지웠다 다시 만드는 사이에 호출이 실패한다).
+
+```bash
+wsl -d Ubuntu -- bash scripts/apply-sql.sh
+```
 
 ## 4. 빌드와 동작 확인
 
@@ -72,12 +78,24 @@ dotnet run -c Release --no-build --project src/Ranking.Bench -- --users 10000 --
 
 본 측정 명령은 [README](README.md#실행)에 있다.
 
+### Visual Studio에서 디버깅
+
+`RankingServer.slnx`를 Visual Studio 2026(또는 2022 17.13 이상)으로 연다. 시작 프로젝트를 고르고 디버그 버튼 옆 드롭다운에서 실행 프로필을 고른 뒤 F5를 누른다.
+
+| 프로젝트 | 프로필 |
+|---|---|
+| Ranking.Bench | 기본 비교 (1만 명, 디버깅용) · 기본 비교 (100만 명) · 깊은 페이지 (10만 명) · 순위 테이블 (10만 명) |
+| Ranking.Api | `redis` · `mysql` — 브라우저에 `/top?n=10`이 열린다 |
+
+중단점에서 오래 멈춰 있어도 WSL이 꺼지지 않게 `wsl -d Ubuntu -- sleep 3600`을 켜 둔다. SP 안쪽은 VS에서 들어갈 수 없으니, SP는 `mysql` 클라이언트로 `CALL sp_ranking_get_rank(12345);`처럼 직접 불러 확인한다.
+
 ## 5. 데이터 직접 보기
 
 ```bash
 wsl -d Ubuntu -- redis-cli ZREVRANGE ranking:season 0 9 WITHSCORES
 wsl -d Ubuntu -- mysql -ubench -pbench ranking -e "SELECT * FROM ranking ORDER BY score DESC, user_id DESC LIMIT 10"
 wsl -d Ubuntu -- mysql -ubench -pbench ranking -e "SELECT * FROM ranking_snapshot WHERE rnk BETWEEN 1 AND 10"   # --snapshot 실행 후
+wsl -d Ubuntu -- mysql -ubench -pbench ranking -e "CALL sp_ranking_get_around(12345, 5)"                        # 게임 서버가 부르는 SP 그대로
 ```
 
 Windows에서 GUI 도구(MySQL Workbench, DBeaver, Redis Insight)로 `127.0.0.1`에 붙어도 된다.

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # WSL2 Ubuntu 안에서 실행한다. 여러 번 실행해도 된다(이미 된 단계는 건너뜀).
-#   - Redis, MySQL 설치 + DB ranking, 계정 bench/bench
+#   - Redis, MySQL 설치 + DB ranking, 계정 bench/bench, sql/의 스키마와 저장 프로시저 적용
 #   - --with-kafka: Kafka 4.3.1 (KRaft 단일 노드, systemd 서비스 kafka)
 #
 # Windows에서: wsl -d Ubuntu -u root -- bash scripts/setup-wsl.sh --with-kafka
@@ -37,6 +37,9 @@ CREATE USER IF NOT EXISTS 'bench'@'localhost' IDENTIFIED BY 'bench';
 GRANT ALL PRIVILEGES ON ranking.* TO 'bench'@'localhost';
 FLUSH PRIVILEGES;
 SQL
+
+echo "==> 스키마와 저장 프로시저 (sql/)"
+bash "$(dirname "$0")/apply-sql.sh"
 
 if $WITH_KAFKA; then
     echo "==> Kafka ${KAFKA_VERSION}"

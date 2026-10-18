@@ -1,4 +1,3 @@
-using System.Data;
 using MySqlConnector;
 
 namespace Ranking.Core;
@@ -17,14 +16,12 @@ public enum SnapshotRebuildMode
 }
 
 /// <summary>
-/// 배치로 미리 계산한 순위 테이블. 점수 갱신은 원본 ranking 테이블에 하고(MySqlRankingStore와 같은 스키마),
-/// 조회는 ranking_snapshot(user_id PK, score, rnk UNIQUE)에서 한다.
+/// 배치로 미리 계산한 순위 테이블. 점수 갱신은 원본 ranking 테이블에 하고(MySqlRankingStore와 같음),
+/// 조회는 ranking_snapshot(user_id PK, score, rnk UNIQUE)에서 한다. 테이블은 sql/schema.sql, 쿼리는 sp_snapshot_*.
 /// 순위는 RebuildAsync를 부른 시점 기준이라 그 뒤 갱신은 다음 재계산까지 반영되지 않는다.
 /// </summary>
 public sealed class MySqlSnapshotRankingStore : IRankingStore
 {
-    private const string Table = "ranking_snapshot";
-
     private readonly MySqlDataSource _dataSource;
     private readonly MySqlRankingStore _live;
 
@@ -36,28 +33,10 @@ public sealed class MySqlSnapshotRankingStore : IRankingStore
         _live = new MySqlRankingStore(connectionString);
     }
 
-    private static string CreateTableSql(string name) => $"""
-        CREATE TABLE {name} (
-            user_id INT    NOT NULL PRIMARY KEY,
-            score   BIGINT NOT NULL,
-            rnk     BIGINT NOT NULL,
-            UNIQUE KEY ix_rnk (rnk)
-        ) ENGINE=InnoDB
-        """;
-
-    // 정렬 기준은 다른 구현과 같다: 점수 내림차순, 동점이면 user_id 내림차순
-    private static string FillSql(string name) => $"""
-        INSERT INTO {name} (user_id, score, rnk)
-        SELECT user_id, score, ROW_NUMBER() OVER (ORDER BY score DESC, user_id DESC)
-        FROM ranking
-        """;
-
     public async Task ResetAsync()
     {
         await _live.ResetAsync();
-        await using var conn = await _dataSource.OpenConnectionAsync();
-        await ExecuteAsync(conn, $"DROP TABLE IF EXISTS {Table}, {Table}_new, {Table}_old");
-        await ExecuteAsync(conn, CreateTableSql(Table));
+        await MySqlProc.ExecuteAsync(_dataSource, "CALL sp_snapshot_reset()");
     }
 
     public Task BulkLoadAsync(IReadOnlyList<(int UserId, long Score)> rows) => _live.BulkLoadAsync(rows);
@@ -73,50 +52,29 @@ public sealed class MySqlSnapshotRankingStore : IRankingStore
     /// </summary>
     public async Task RebuildAsync(SnapshotRebuildMode mode = SnapshotRebuildMode.Swap, bool readCommitted = true, bool analyze = true)
     {
+        var call = mode switch
+        {
+            SnapshotRebuildMode.Swap => "CALL sp_snapshot_rebuild_swap(@a)",
+            SnapshotRebuildMode.Truncate => "CALL sp_snapshot_rebuild_truncate(@a)",
+            SnapshotRebuildMode.DeleteInTransaction => "CALL sp_snapshot_rebuild_delete(@a)",
+            _ => throw new ArgumentOutOfRangeException(nameof(mode)),
+        };
+
         await using var conn = await _dataSource.OpenConnectionAsync();
         if (readCommitted)
-            await ExecuteAsync(conn, "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED");
-
-        switch (mode)
         {
-            case SnapshotRebuildMode.Swap:
-                await ExecuteAsync(conn, $"DROP TABLE IF EXISTS {Table}_new, {Table}_old");
-                await ExecuteAsync(conn, CreateTableSql(Table + "_new"));
-                await ExecuteAsync(conn, FillSql(Table + "_new"));
-                if (analyze)
-                    await ExecuteAsync(conn, $"ANALYZE TABLE {Table}_new");
-                // 여러 테이블 RENAME은 원자적이다. 조회는 이전 테이블 아니면 새 테이블을 보고, 그 사이는 없다.
-                await ExecuteAsync(conn, $"RENAME TABLE {Table} TO {Table}_old, {Table}_new TO {Table}");
-                await ExecuteAsync(conn, $"DROP TABLE {Table}_old");
-                break;
-
-            case SnapshotRebuildMode.Truncate:
-                await ExecuteAsync(conn, $"TRUNCATE TABLE {Table}");
-                await ExecuteAsync(conn, FillSql(Table));
-                if (analyze)
-                    await ExecuteAsync(conn, $"ANALYZE TABLE {Table}");
-                break;
-
-            case SnapshotRebuildMode.DeleteInTransaction:
-                await using (var tx = await conn.BeginTransactionAsync(readCommitted ? IsolationLevel.ReadCommitted : IsolationLevel.RepeatableRead))
-                {
-                    await ExecuteAsync(conn, $"DELETE FROM {Table}", tx);
-                    await ExecuteAsync(conn, FillSql(Table), tx);
-                    await tx.CommitAsync();
-                }
-                if (analyze)
-                    await ExecuteAsync(conn, $"ANALYZE TABLE {Table}");
-                break;
+            // 세션 설정이라 이 연결에만 적용된다. 연결이 풀로 돌아갈 때 초기화된다.
+            await using var set = new MySqlCommand("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED", conn);
+            await set.ExecuteNonQueryAsync();
         }
+        await using var cmd = MySqlProc.Command(conn, call, ("@a", analyze));
+        await cmd.ExecuteNonQueryAsync();
     }
 
     public async Task<long?> GetRankAsync(int userId)
     {
-        await using var conn = await _dataSource.OpenConnectionAsync();
-        await using var cmd = new MySqlCommand($"SELECT rnk FROM {Table} WHERE user_id = @u", conn);
-        cmd.Parameters.AddWithValue("@u", userId);
-        var result = await cmd.ExecuteScalarAsync();
-        return result is null or DBNull ? null : Convert.ToInt64(result);
+        var result = await MySqlProc.ScalarAsync(_dataSource, "CALL sp_snapshot_get_rank(@u)", ("@u", userId));
+        return result is null ? null : Convert.ToInt64(result);
     }
 
     public Task<IReadOnlyList<RankEntry>> GetTopAsync(int n) => RangeAsync(1, n);
@@ -124,52 +82,16 @@ public sealed class MySqlSnapshotRankingStore : IRankingStore
     // OFFSET 대신 rnk 범위로 찾으니 깊은 페이지도 인덱스에서 바로 그 위치로 간다.
     public Task<IReadOnlyList<RankEntry>> GetPageAsync(long offset, int count) => RangeAsync(offset + 1, offset + count);
 
-    public async Task<IReadOnlyList<RankEntry>> GetAroundAsync(int userId, int range)
-    {
-        await using var conn = await _dataSource.OpenConnectionAsync();
-        await using var cmd = new MySqlCommand($"""
-            SELECT s.user_id, s.score, s.rnk
-            FROM {Table} me
-            JOIN {Table} s ON s.rnk BETWEEN me.rnk - @k AND me.rnk + @k
-            WHERE me.user_id = @u
-            ORDER BY s.rnk
-            """, conn);
-        cmd.Parameters.AddWithValue("@u", userId);
-        cmd.Parameters.AddWithValue("@k", range);
-        return await ReadEntriesAsync(cmd, range * 2 + 1);
-    }
+    public async Task<IReadOnlyList<RankEntry>> GetAroundAsync(int userId, int range) =>
+        await MySqlProc.ReadAsync(_dataSource, "CALL sp_snapshot_get_around(@u, @k)", ToEntry, ("@u", userId), ("@k", range));
 
-    public async Task<long> CountAsync()
-    {
-        await using var conn = await _dataSource.OpenConnectionAsync();
-        await using var cmd = new MySqlCommand($"SELECT COUNT(*) FROM {Table}", conn);
-        return Convert.ToInt64(await cmd.ExecuteScalarAsync());
-    }
+    public async Task<long> CountAsync() =>
+        Convert.ToInt64(await MySqlProc.ScalarAsync(_dataSource, "CALL sp_snapshot_count()"));
 
-    private async Task<IReadOnlyList<RankEntry>> RangeAsync(long fromRank, long toRank)
-    {
-        await using var conn = await _dataSource.OpenConnectionAsync();
-        await using var cmd = new MySqlCommand(
-            $"SELECT user_id, score, rnk FROM {Table} WHERE rnk BETWEEN @from AND @to ORDER BY rnk", conn);
-        cmd.Parameters.AddWithValue("@from", fromRank);
-        cmd.Parameters.AddWithValue("@to", toRank);
-        return await ReadEntriesAsync(cmd, (int)(toRank - fromRank + 1));
-    }
+    private async Task<IReadOnlyList<RankEntry>> RangeAsync(long fromRank, long toRank) =>
+        await MySqlProc.ReadAsync(_dataSource, "CALL sp_snapshot_get_range(@from, @to)", ToEntry, ("@from", fromRank), ("@to", toRank));
 
-    private static async Task<IReadOnlyList<RankEntry>> ReadEntriesAsync(MySqlCommand cmd, int capacity)
-    {
-        var result = new List<RankEntry>(capacity);
-        await using var reader = await cmd.ExecuteReaderAsync();
-        while (await reader.ReadAsync())
-            result.Add(new RankEntry(reader.GetInt32(0), reader.GetInt64(1), reader.GetInt64(2)));
-        return result;
-    }
-
-    private static async Task ExecuteAsync(MySqlConnection conn, string sql, MySqlTransaction? tx = null)
-    {
-        await using var cmd = new MySqlCommand(sql, conn, tx) { CommandTimeout = 0 };
-        await cmd.ExecuteNonQueryAsync();
-    }
+    private static RankEntry ToEntry(MySqlDataReader r) => new(r.GetInt32(0), r.GetInt64(1), r.GetInt64(2));
 
     public async ValueTask DisposeAsync()
     {

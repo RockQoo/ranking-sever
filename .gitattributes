@@ -1,2 +1,3 @@
-# WSL에서 실행하는 스크립트는 CRLF면 bash가 깨진다
+# WSL에서 실행하는 스크립트와 mysql 클라이언트로 넣는 SQL은 CRLF면 깨진다
 *.sh text eol=lf
+*.sql text eol=lf
